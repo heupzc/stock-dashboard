@@ -116,6 +116,15 @@
     .btn-refresh .spin { display: inline-block; animation: spin 1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .tool-btn {
+      width: 28px; height: 28px; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--bg-card);
+      cursor: pointer; font-size: 13px; color: var(--text-secondary);
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.2s;
+    }
+    .tool-btn:hover, .tool-btn.active { border-color: var(--accent); color: var(--accent); background: var(--accent-glow); }
+
     /* 主布局 */
     .container { max-width: 1440px; margin: 0 auto; padding: 24px; }
 
@@ -442,6 +451,7 @@
     <button class="btn-icon" id="theme-btn" title="切换主题" onclick="toggleTheme()">🌙</button>
     <button class="btn-icon" title="配置 API Token" onclick="showTokenModal()" id="token-btn">🔑</button>
     <button class="btn-icon" title="添加股票" onclick="showAddModal()">＋</button>
+    <button class="btn-icon" id="auto-refresh-btn" title="自动刷新（当前关闭）" onclick="toggleAutoRefresh()">⏱</button>
     <button class="btn-refresh" id="refresh-btn" onclick="refreshAll()">
       <span id="refresh-icon">⟳</span> 刷新数据
     </button>
@@ -513,6 +523,12 @@
               <button class="tab-btn active" data-period="daily" onclick="changePeriod(this,'daily')">日线</button>
               <button class="tab-btn" data-period="weekly" onclick="changePeriod(this,'weekly')">周线</button>
               <button class="tab-btn" data-period="monthly" onclick="changePeriod(this,'monthly')">月线</button>
+              <button class="tab-btn" data-period="minute" onclick="changePeriod(this,'minute')">分时</button>
+            </div>
+            <div class="drawing-tools" id="drawing-tools" style="display:flex;align-items:center;gap:4px;margin-left:auto;">
+              <button class="tool-btn" title="画水平线" onclick="setDrawMode('hline')">━</button>
+              <button class="tool-btn" title="画趋势线" onclick="setDrawMode('trendline')">╱</button>
+              <button class="tool-btn" title="清除画线" onclick="clearDrawings()">✕</button>
             </div>
             <span id="chart-stock-name" style="font-size:13px;color:var(--accent);font-weight:600;"></span>
           </div>
@@ -980,7 +996,8 @@ async function loadStockData() {
   if(!selectedCode && holdings.length > 0) {
     selectStock(holdings[0].code);
   } else if(selectedCode) {
-    loadKline(selectedCode, currentPeriod);
+    if(currentPeriod === 'minute') { loadMinuteChart(selectedCode); }
+    else { loadKline(selectedCode, currentPeriod); }
     loadMoneyflow(selectedCode);
   }
 }
@@ -1239,7 +1256,11 @@ function selectStock(code) {
     const codeEl = el.querySelector('.stock-code');
     el.classList.toggle('active', codeEl && codeEl.textContent === code);
   });
-  loadKline(code, currentPeriod);
+  if(currentPeriod === 'minute') {
+    loadMinuteChart(code);
+  } else {
+    loadKline(code, currentPeriod);
+  }
   loadMoneyflow(code);
   renderIndicators(code);
   renderAdvice(code);
@@ -1354,6 +1375,13 @@ function renderKlineChart(data, code) {
     }]
   });
 
+  // Chart click handler for drawing
+  kChart.getZr().off('click');
+  kChart.getZr().on('click', function(params) { handleChartClick(params, kChart, code); });
+
+  // Apply drawings if any
+  applyDrawings(kChart, code);
+
   window.addEventListener('resize', () => { kChart.resize(); vChart.resize(); });
 }
 
@@ -1371,7 +1399,131 @@ function changePeriod(btn, period) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   currentPeriod = period;
-  if(selectedCode) loadKline(selectedCode, period);
+  if(!selectedCode) return;
+  if(period === 'minute') {
+    loadMinuteChart(selectedCode);
+  } else {
+    loadKline(selectedCode, period);
+  }
+}
+
+// ============================================================
+//  分时线图
+// ============================================================
+async function loadMinuteChart(code) {
+  const h = holdings.find(s => s.code === code);
+  const wl = watchlist.find(s => s.code === code);
+  const stock = h || wl;
+  const market = stock ? (stock.market || getMarket(code)) : getMarket(code);
+  const fullCode = market + code;
+
+  const url = `https://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data_${fullCode}&code=${fullCode}`;
+
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const text = await resp.text();
+    const jsonStr = text.replace(/^var\s+\w+\s*=\s*/, '');
+    const data = JSON.parse(jsonStr);
+
+    const minuteData = data?.data?.data?.[fullCode]?.data?.data || data?.data?.data || [];
+    if(!minuteData || !minuteData.length) {
+      renderMinuteChartEmpty(code);
+      return;
+    }
+
+    const times = [];
+    const prices = [];
+    const vols = [];
+    const avgPrices = [];
+    let preClose = null;
+
+    // 提取昨收价
+    const stockMinData = data?.data?.data?.[fullCode]?.data;
+    if(stockMinData && stockMinData.pre != null) {
+      preClose = parseFloat(stockMinData.pre);
+    } else if(data?.data?.data?.[fullCode]?.qt?.[fullCode]) {
+      const qtArr = data.data.data[fullCode].qt[fullCode];
+      if(qtArr && qtArr[4]) preClose = parseFloat(qtArr[4]);
+    }
+
+    minuteData.forEach(item => {
+      const parts = item.split(',');
+      const time = parts[0];
+      const price = parseFloat(parts[1]);
+      const avgPrice = parseFloat(parts[2]);
+      const vol = parseFloat(parts[3]);
+      times.push(time.slice(0,2) + ':' + time.slice(2));
+      prices.push(price);
+      avgPrices.push(avgPrice);
+      vols.push(vol);
+    });
+
+    renderMinuteChart(times, prices, avgPrices, vols, preClose, code);
+  } catch(e) {
+    console.warn('分时数据获取失败:', e);
+    renderMinuteChartEmpty(code);
+  }
+}
+
+function renderMinuteChart(times, prices, avgPrices, vols, preClose, code) {
+  const chartEl = document.getElementById('kline-chart');
+  const indEl = document.getElementById('indicator-chart');
+  if(!chartEl) return;
+
+  const kChart = echarts.init(chartEl, isDark ? 'dark' : null, { renderer: 'canvas' });
+  const vChart = echarts.init(indEl, isDark ? 'dark' : null, { renderer: 'canvas' });
+
+  const bg = isDark ? '#0f1628' : '#ffffff';
+  const textColor = isDark ? '#8896b3' : '#4a5a7a';
+  const lineColor = isDark ? '#1e2d4e' : '#e8edf5';
+
+  const lastPrice = prices[prices.length - 1];
+  const color = preClose ? (lastPrice >= preClose ? '#ff5c5c' : '#00d48a') : '#4f8ef7';
+
+  const preCloseLine = preClose ? times.map(() => preClose) : [];
+
+  const legendData = ['价格', '均价'];
+  if(preClose) legendData.push('昨收');
+
+  kChart.setOption({
+    backgroundColor: bg,
+    animation: true,
+    tooltip: { trigger: 'axis', backgroundColor: isDark ? 'rgba(15,22,40,0.95)' : 'rgba(255,255,255,0.95)', borderColor: '#4f8ef7', textStyle: { color: textColor, fontSize: 12 } },
+    legend: { data: legendData, top: 6, textStyle: { color: textColor, fontSize: 11 } },
+    grid: { left: 60, right: 12, top: 40, bottom: 0 },
+    xAxis: { type: 'category', data: times, axisLine: { lineStyle: { color: lineColor } }, axisLabel: { color: textColor, fontSize: 10, interval: 29 } },
+    yAxis: { type: 'value', scale: true, axisLine: { lineStyle: { color: lineColor } }, splitLine: { lineStyle: { color: lineColor, type: 'dashed' } }, axisLabel: { color: textColor, fontSize: 10 } },
+    series: [
+      { name: '价格', type: 'line', data: prices, showSymbol: false, lineStyle: { width: 1.5, color: color }, areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{offset: 0, color: color + '33'}, {offset: 1, color: color + '05'}] } }, itemStyle: { color: color } },
+      { name: '均价', type: 'line', data: avgPrices, showSymbol: false, lineStyle: { width: 1, color: '#ffd166' }, itemStyle: { color: '#ffd166' } },
+      ...(preClose ? [{ name: '昨收', type: 'line', data: preCloseLine, showSymbol: false, lineStyle: { width: 1, type: 'dashed', color: '#8896b3' }, itemStyle: { color: '#8896b3' } }] : [])
+    ]
+  });
+
+  // Apply drawings if any
+  applyDrawings(kChart, code);
+
+  vChart.setOption({
+    backgroundColor: bg,
+    grid: { left: 60, right: 12, top: 6, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLabel: { show: false }, axisLine: { lineStyle: { color: lineColor } } },
+    yAxis: { type: 'value', axisLabel: { color: textColor, fontSize: 10 }, splitLine: { lineStyle: { color: lineColor, type: 'dashed' } } },
+    tooltip: { trigger: 'axis', backgroundColor: isDark ? 'rgba(15,22,40,0.95)' : 'rgba(255,255,255,0.95)', borderColor: '#4f8ef7', textStyle: { color: textColor } },
+    series: [{ type: 'bar', data: vols.map((v, i) => ({ value: v, itemStyle: { color: prices[i] >= (preClose || prices[0]) ? '#ff5c5c' : '#00d48a' } })) }]
+  });
+
+  // Chart click handler for drawing
+  kChart.getZr().off('click');
+  kChart.getZr().on('click', function(params) { handleChartClick(params, kChart, code); });
+
+  window.addEventListener('resize', () => { kChart.resize(); vChart.resize(); });
+}
+
+function renderMinuteChartEmpty(code) {
+  const chartEl = document.getElementById('kline-chart');
+  const indEl = document.getElementById('indicator-chart');
+  if(chartEl) chartEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:13px;">分时数据暂不可用（非交易时段或数据获取失败）</div>';
+  if(indEl) indEl.innerHTML = '';
 }
 
 // ============================================================
@@ -2085,7 +2237,10 @@ function toggleTheme() {
   document.body.removeAttribute('style');
   // 重绘图表
   klineData = {};
-  if(selectedCode) loadKline(selectedCode, currentPeriod);
+  if(selectedCode) {
+    if(currentPeriod === 'minute') { loadMinuteChart(selectedCode); }
+    else { loadKline(selectedCode, currentPeriod); }
+  }
   renderPnlChart();
 }
 
@@ -2143,6 +2298,107 @@ async function refreshAll() {
   btn.classList.remove('loading');
   icon.className = '';
   icon.textContent = '⟳';
+}
+
+// ============================================================
+//  自动定时刷新
+// ============================================================
+let autoRefreshInterval = null;
+let autoRefreshEnabled = false;
+let autoRefreshCountdown = 30;
+
+function toggleAutoRefresh() {
+  autoRefreshEnabled = !autoRefreshEnabled;
+  const btn = document.getElementById('auto-refresh-btn');
+  if(autoRefreshEnabled) {
+    btn.style.borderColor = 'var(--green)';
+    btn.style.color = 'var(--green)';
+    btn.title = '自动刷新（已开启，30秒）';
+    autoRefreshCountdown = 30;
+    autoRefreshInterval = setInterval(() => {
+      autoRefreshCountdown--;
+      btn.title = `自动刷新（${autoRefreshCountdown}秒后刷新）`;
+      if(autoRefreshCountdown <= 0) {
+        autoRefreshCountdown = 30;
+        refreshAll();
+      }
+    }, 1000);
+  } else {
+    btn.style.borderColor = '';
+    btn.style.color = '';
+    btn.title = '自动刷新（当前关闭）';
+    if(autoRefreshInterval) { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }
+  }
+}
+
+// ============================================================
+//  K线画线工具
+// ============================================================
+let drawMode = null; // null, 'hline', 'trendline'
+let drawings = {}; // { code: [{ type, data }] }
+
+function setDrawMode(mode) {
+  if(drawMode === mode) { drawMode = null; }
+  else { drawMode = mode; }
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+  if(drawMode) {
+    const btns = document.querySelectorAll('.tool-btn');
+    btns.forEach(b => {
+      if((drawMode === 'hline' && b.title === '画水平线') || (drawMode === 'trendline' && b.title === '画趋势线')) b.classList.add('active');
+    });
+  }
+  // 趋势线暂未完全实现，提示用户
+  if(mode === 'trendline') {
+    alert('趋势线功能开发中，暂仅支持水平线画线');
+    drawMode = null;
+    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+  }
+}
+
+function clearDrawings() {
+  const code = selectedCode;
+  drawings[code] = [];
+  if(currentPeriod === 'minute') { loadMinuteChart(code); }
+  else { loadKline(code, currentPeriod); }
+}
+
+function handleChartClick(params, chart, code) {
+  if(!drawMode) return;
+  const pointInPixel = [params.offsetX, params.offsetY];
+  const pointInGrid = chart.containPixel('grid', pointInPixel);
+  if(!pointInGrid) return;
+
+  const yValue = chart.convertFromPixel({seriesIndex: 0}, pointInPixel)[1];
+
+  if(!drawings[code]) drawings[code] = [];
+
+  if(drawMode === 'hline') {
+    drawings[code].push({ type: 'hline', value: parseFloat(yValue.toFixed(2)) });
+    applyDrawings(chart, code);
+    drawMode = null;
+    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+  }
+}
+
+function applyDrawings(chart, code) {
+  if(!drawings[code] || !drawings[code].length) return;
+
+  const markLineData = [];
+  drawings[code].forEach(d => {
+    if(d.type === 'hline') {
+      markLineData.push({
+        yAxis: d.value,
+        lineStyle: { type: 'dashed', color: '#ff9f43', width: 1.5 },
+        label: { show: true, formatter: d.value.toFixed(2), position: 'end', color: '#ff9f43', fontSize: 10 }
+      });
+    }
+  });
+
+  if(markLineData.length > 0) {
+    chart.setOption({
+      series: [{ markLine: { silent: true, symbol: 'none', data: markLineData } }]
+    });
+  }
 }
 
 // ============================================================

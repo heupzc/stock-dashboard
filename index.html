@@ -876,52 +876,50 @@ function getMarket(code) {
   return 'sz';
 }
 
-// 网易历史行情（公开，无需token）
-async function fetchNeteaseHistory(code, market, days=120) {
-  const prefix = market === 'sh' ? '0' : '1';
-  const end = getToday();
-  const startD = new Date(); startD.setDate(startD.getDate() - days);
-  const start = `${startD.getFullYear()}${String(startD.getMonth()+1).padStart(2,'0')}${String(startD.getDate()).padStart(2,'0')}`;
-
-  const url = `https://img1.money.126.net/data/hs/kline/day/history/${new Date().getFullYear()}/${prefix}${code}.json`;
-  const proxies = [
-    `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  ];
-  for(const proxy of proxies) {
-    try {
-      const resp = await fetch(proxy, { signal: AbortSignal.timeout(10000) });
-      const text = await resp.text();
-      let raw;
-      try { raw = JSON.parse(JSON.parse(text).contents || '{}'); } catch(e) { raw = JSON.parse(text); }
-      if(!raw.data) continue;
-      return raw.data.filter(r => r[0] >= parseInt(start)).map(r => ({
-        trade_date: String(r[0]),
-        open: r[1], high: r[2], low: r[3], close: r[4],
-        pct_chg: r[5], vol: r[7], amount: r[8]/1000,
-        pre_close: r[4]/(1+r[5]/100)
-      }));
-    } catch(e) { console.warn(`历史行情代理失败(${code}):`, e.message); }
-  }
-  // 最终回退：直接请求网易（可能因CORS失败）
+// 腾讯历史K线行情（公开，无需token，无需CORS代理）
+async function fetchTencentHistory(code, market, period='daily', count=120) {
+  const fullCode = market + code;
+  // 腾讯K线接口: period=day/week/month, qfq=前复权
+  const periodMap = { daily: 'day', weekly: 'week', monthly: 'month' };
+  const p = periodMap[period] || 'day';
+  const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${fullCode},${p},,,${count},qfq`;
   try {
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
     const raw = await resp.json();
-    if(!raw.data) return [];
-    return raw.data.filter(r => r[0] >= parseInt(start)).map(r => ({
-      trade_date: String(r[0]),
-      open: r[1], high: r[2], low: r[3], close: r[4],
-      pct_chg: r[5], vol: r[7], amount: r[8]/1000,
-      pre_close: r[4]/(1+r[5]/100)
-    }));
+    const dataKey = `qfq${p}`; // qfqday / qfqweek / qfqmonth
+    const arr = raw?.data?.[fullCode]?.[dataKey];
+    if(!arr || !arr.length) return [];
+    // 腾讯格式: [date, open, close, high, low, vol] 或含分红对象
+    return arr.filter(r => Array.isArray(r)).map((r, i, all) => {
+      const vol = parseFloat(r[5]) || 0;
+      const close = parseFloat(r[2]);
+      const open = parseFloat(r[1]);
+      const high = parseFloat(r[3]);
+      const low = parseFloat(r[4]);
+      // 用前一天close作为pre_close计算涨跌幅
+      let preClose = open;
+      if(i > 0) {
+        const prev = all[i-1];
+        if(Array.isArray(prev)) preClose = parseFloat(prev[2]);
+      }
+      const pct_chg = preClose ? ((close - preClose) / preClose * 100).toFixed(2) : 0;
+      return {
+        trade_date: r[0].replace(/-/g, ''),
+        open: open, close: close,
+        high: high, low: low,
+        pct_chg: parseFloat(pct_chg),
+        vol: vol, amount: 0,
+        pre_close: preClose
+      };
+    });
   } catch(e) {
-    console.warn(`网易历史行情全部失败(${code})`);
+    console.warn(`腾讯历史行情失败(${code}):`, e.message);
     return [];
   }
 }
 
 // ============================================================
-//  加载持仓股票行情（优先新浪实时，历史用网易）
+//  加载持仓股票行情（优先腾讯实时，历史用腾讯K线）
 // ============================================================
 async function loadStockData() {
   // 先读缓存
@@ -1273,19 +1271,23 @@ function selectStock(code) {
 }
 
 // ============================================================
-//  K 线图（网易历史数据，公开免费）
+//  K 线图（腾讯历史数据，公开免费，无需CORS代理）
 // ============================================================
 async function loadKline(code, period) {
   if(!klineData[code]) klineData[code] = {};
   if(!klineData[code][period]) {
     const h = holdings.find(s => s.code === code) || watchlist.find(s => s.code === code);
     const market = h ? (h.market || getMarket(code)) : getMarket(code);
-    const daysMap = { daily: 120, weekly: 360, monthly: 720 };
-    // 网易只有日线，周/月线通过聚合日线实现
-    const rawDaily = await fetchNeteaseHistory(code, market, daysMap.daily);
-    klineData[code]['daily'] = rawDaily;
-    klineData[code]['weekly'] = aggregateKline(rawDaily, 'weekly');
-    klineData[code]['monthly'] = aggregateKline(rawDaily, 'monthly');
+    const countMap = { daily: 120, weekly: 120, monthly: 60 };
+    // 腾讯直接支持日/周/月K线，无需手动聚合
+    const data = await fetchTencentHistory(code, market, period, countMap[period] || 120);
+    klineData[code][period] = data;
+    // 同时预加载日线（用于技术指标计算）
+    if(period !== 'daily' && !klineData[code]['daily']) {
+      klineData[code]['daily'] = await fetchTencentHistory(code, market, 'daily', 120);
+    }
+    // K线数据加载后刷新技术指标
+    if(code === selectedCode) renderIndicators(code);
   }
   renderKlineChart(klineData[code][period], code);
 }
@@ -1293,7 +1295,15 @@ async function loadKline(code, period) {
 function renderKlineChart(data, code) {
   const chartEl = document.getElementById('kline-chart');
   const indEl = document.getElementById('indicator-chart');
-  if(!chartEl || !data.length) return;
+  if(!chartEl) return;
+  if(!data || !data.length) {
+    const kChart = echarts.init(chartEl, isDark ? 'dark' : null, { renderer: 'canvas' });
+    kChart.setOption({
+      title: { text: '暂无K线数据', left: 'center', top: 'center',
+        textStyle: { color: isDark ? '#8896b3' : '#999', fontSize: 14 } }
+    });
+    return;
+  }
 
   const kChart = echarts.init(chartEl, isDark ? 'dark' : null, { renderer: 'canvas' });
   const vChart = echarts.init(indEl, isDark ? 'dark' : null, { renderer: 'canvas' });
@@ -1425,7 +1435,7 @@ async function loadMinuteChart(code) {
     const jsonStr = text.replace(/^var\s+\w+\s*=\s*/, '');
     const data = JSON.parse(jsonStr);
 
-    const minuteData = data?.data?.data?.[fullCode]?.data?.data || data?.data?.data || [];
+    const minuteData = data?.data?.[fullCode]?.data?.data || [];
     if(!minuteData || !minuteData.length) {
       renderMinuteChartEmpty(code);
       return;
@@ -1437,21 +1447,21 @@ async function loadMinuteChart(code) {
     const avgPrices = [];
     let preClose = null;
 
-    // 提取昨收价
-    const stockMinData = data?.data?.data?.[fullCode]?.data;
-    if(stockMinData && stockMinData.pre != null) {
-      preClose = parseFloat(stockMinData.pre);
-    } else if(data?.data?.data?.[fullCode]?.qt?.[fullCode]) {
-      const qtArr = data.data.data[fullCode].qt[fullCode];
-      if(qtArr && qtArr[4]) preClose = parseFloat(qtArr[4]);
+    // 提取昨收价 - 从qt字段获取
+    const qtData = data?.data?.[fullCode]?.qt?.[fullCode];
+    if(qtData && qtData[4]) {
+      preClose = parseFloat(qtData[4]);
     }
 
+    let prevVol = 0;
     minuteData.forEach(item => {
-      const parts = item.split(',');
+      const parts = item.trim().split(/\s+/); // 腾讯格式: "0930 5.29 3373 1784317.00" 空格分隔
       const time = parts[0];
       const price = parseFloat(parts[1]);
       const avgPrice = parseFloat(parts[2]);
-      const vol = parseFloat(parts[3]);
+      const cumVol = parseFloat(parts[3]) || 0;
+      const vol = cumVol - prevVol; // 增量成交量
+      prevVol = cumVol;
       times.push(time.slice(0,2) + ':' + time.slice(2));
       prices.push(price);
       avgPrices.push(avgPrice);

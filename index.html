@@ -771,36 +771,85 @@ async function callApi(api_name, params, fields='') {
 //  新浪行情代理（公开，实时数据，无需 token）
 // ============================================================
 async function fetchSinaRealtime(stocks) {
+  // 优先使用腾讯行情API（无需跨域代理，更稳定）
+  const tencentResult = await fetchTencentRealtime(stocks);
+  if(Object.keys(tencentResult).length > 0) return tencentResult;
+
+  // 回退：新浪行情 + 多代理轮换
   const codes = stocks.map(h => (h.market || getMarket(h.code)) + h.code).join(',');
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+codes)}`;
+  const proxies = [
+    `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+codes)}`,
+    `https://corsproxy.io/?${encodeURIComponent('https://hq.sinajs.cn/list='+codes)}`,
+  ];
+  for(const proxy of proxies) {
+    try {
+      const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
+      const text = await resp.text();
+      let raw = '';
+      try { raw = JSON.parse(text).contents || ''; } catch(e) { raw = text; }
+      const results = {};
+      raw.split('\n').forEach(line => {
+        const m = line.match(/var hq_str_([a-z]{2}\d+)="(.*)"/);
+        if(!m) return;
+        const fullCode = m[1];
+        const code = fullCode.slice(2);
+        const parts = m[2].split(',');
+        if(parts.length < 32) return;
+        results[code] = {
+          name: parts[0],
+          open: parseFloat(parts[1]),
+          pre_close: parseFloat(parts[2]),
+          close: parseFloat(parts[3]),
+          high: parseFloat(parts[4]),
+          low: parseFloat(parts[5]),
+          vol: parseFloat(parts[8])/100,
+          amount: parseFloat(parts[9])/1000,
+          pct_chg: parts[2]>0 ? ((parts[3]-parts[2])/parts[2]*100).toFixed(2) : 0,
+          trade_date: parts[30]?.replace(/-/g,''),
+        };
+      });
+      if(Object.keys(results).length > 0) return results;
+    } catch(e) { console.warn('代理失败，尝试下一个:', e.message); }
+  }
+  return {};
+}
+
+// 腾讯行情API（无需跨域代理，直接可用）
+async function fetchTencentRealtime(stocks) {
+  const codes = stocks.map(h => (h.market || getMarket(h.code)) + h.code).join(',');
+  const url = `https://qt.gtimg.cn/q=${codes}`;
   try {
-    const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    const raw = json.contents || '';
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const text = await resp.text();
     const results = {};
-    raw.split('\n').forEach(line => {
-      const m = line.match(/var hq_str_([a-z]{2}\d+)="(.*)"/);
+    text.split(';\n').forEach(line => {
+      const m = line.match(/v_([sh|sz]{2}\d+)="(.*)"/);
       if(!m) return;
       const fullCode = m[1];
       const code = fullCode.slice(2);
-      const parts = m[2].split(',');
-      if(parts.length < 32) return;
+      const raw = m[2];
+      if(!raw) return;
+      const parts = raw.split('~');
+      if(parts.length < 48) return;
       results[code] = {
-        name: parts[0],
-        open: parseFloat(parts[1]),
-        pre_close: parseFloat(parts[2]),
+        name: parts[1],
+        open: parseFloat(parts[5]),
+        pre_close: parseFloat(parts[4]),
         close: parseFloat(parts[3]),
-        high: parseFloat(parts[4]),
-        low: parseFloat(parts[5]),
-        vol: parseFloat(parts[8])/100,
-        amount: parseFloat(parts[9])/1000,
-        pct_chg: parts[2]>0 ? ((parts[3]-parts[2])/parts[2]*100).toFixed(2) : 0,
+        high: parseFloat(parts[33]) || parseFloat(parts[3]),
+        low: parseFloat(parts[34]) || parseFloat(parts[3]),
+        vol: parseFloat(parts[6])/100,
+        amount: parseFloat(parts[37])/1000,
+        pct_chg: parseFloat(parts[32]).toFixed(2),
         trade_date: parts[30]?.replace(/-/g,''),
+        pe_ttm: parts[39] ? parseFloat(parts[39]) : null,
+        turnover_rate: parts[38] ? parseFloat(parts[38]) : null,
+        total_mv: parts[45] ? parseFloat(parts[45]) : null,
       };
     });
     return results;
   } catch(e) {
-    console.warn('新浪行情获取失败:', e);
+    console.warn('腾讯行情获取失败:', e);
     return {};
   }
 }
@@ -819,11 +868,29 @@ async function fetchNeteaseHistory(code, market, days=120) {
   const start = `${startD.getFullYear()}${String(startD.getMonth()+1).padStart(2,'0')}${String(startD.getDate()).padStart(2,'0')}`;
 
   const url = `https://img1.money.126.net/data/hs/kline/day/history/${new Date().getFullYear()}/${prefix}${code}.json`;
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+  const proxies = [
+    `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  ];
+  for(const proxy of proxies) {
+    try {
+      const resp = await fetch(proxy, { signal: AbortSignal.timeout(10000) });
+      const text = await resp.text();
+      let raw;
+      try { raw = JSON.parse(JSON.parse(text).contents || '{}'); } catch(e) { raw = JSON.parse(text); }
+      if(!raw.data) continue;
+      return raw.data.filter(r => r[0] >= parseInt(start)).map(r => ({
+        trade_date: String(r[0]),
+        open: r[1], high: r[2], low: r[3], close: r[4],
+        pct_chg: r[5], vol: r[7], amount: r[8]/1000,
+        pre_close: r[4]/(1+r[5]/100)
+      }));
+    } catch(e) { console.warn(`历史行情代理失败(${code}):`, e.message); }
+  }
+  // 最终回退：直接请求网易（可能因CORS失败）
   try {
-    const resp = await fetch(proxy, { signal: AbortSignal.timeout(10000) });
-    const json = await resp.json();
-    const raw = JSON.parse(json.contents || '{}');
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const raw = await resp.json();
     if(!raw.data) return [];
     return raw.data.filter(r => r[0] >= parseInt(start)).map(r => ({
       trade_date: String(r[0]),
@@ -832,7 +899,7 @@ async function fetchNeteaseHistory(code, market, days=120) {
       pre_close: r[4]/(1+r[5]/100)
     }));
   } catch(e) {
-    console.warn(`网易历史行情失败(${code}):`, e);
+    console.warn(`网易历史行情全部失败(${code})`);
     return [];
   }
 }
@@ -1665,23 +1732,40 @@ async function loadSentiment() {
     { code: 's_sz399300', name: '沪深300',  color: '#a78bfa' },
     { code: 's_sz399006', name: '创业板指', color: '#ffd166' },
   ];
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+indices.map(i=>i.code).join(','))}`;
+  // 优先使用腾讯API获取大盘指数
+  const tencentCodes = 'sh000001,sz399001,sz399006,sz399300,sh000905,sh000016';
   let indexData = {};
   try {
-    const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    const raw = json.contents || '';
-    raw.split('\n').forEach(line => {
-      const m = line.match(/var hq_str_([^=]+)="(.*)"/);
+    const resp = await fetch(`https://qt.gtimg.cn/q=${tencentCodes}`, { signal: AbortSignal.timeout(8000) });
+    const text = await resp.text();
+    text.split(';\n').forEach(line => {
+      const m = line.match(/v_([sh|sz]{2}\d+)="(.*)"/);
       if(!m) return;
-      const parts = m[2].split(',');
-      indexData[m[1]] = {
-        name: parts[0],
-        close: parseFloat(parts[1]),
-        pct_chg: parseFloat(parts[3]),
-      };
+      const parts = m[2].split('~');
+      if(parts.length < 48) return;
+      // 腾讯代码映射回新浪格式
+      const tencentToSina = { 'sh000001':'s_sh000001', 'sz399001':'s_sz399001', 'sz399006':'s_sz399006', 'sz399300':'s_sz399300', 'sh000905':'s_sh000905', 'sh000016':'s_sh000016' };
+      const sinaKey = tencentToSina[m[1]];
+      if(sinaKey) {
+        indexData[sinaKey] = { close: parseFloat(parts[3]), pct_chg: parseFloat(parts[32]) };
+      }
     });
-  } catch(e) { console.warn('大盘指数获取失败'); }
+  } catch(e) { console.warn('腾讯大盘指数失败，回退新浪'); }
+  // 回退新浪（仅在腾讯数据不足时）
+  if(Object.keys(indexData).length < 3) {
+    const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+indices.map(i=>i.code).join(','))}`;
+    try {
+      const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
+      const json = await resp.json();
+      const raw = json.contents || '';
+      raw.split('\n').forEach(line => {
+        const m = line.match(/var hq_str_([^=]+)="(.*)"/);
+        if(!m) return;
+        const parts = m[2].split(',');
+        indexData[m[1]] = { name: parts[0], close: parseFloat(parts[1]), pct_chg: parseFloat(parts[3]) };
+      });
+    } catch(e) { console.warn('大盘指数获取失败'); }
+  }
 
   const allStocks = [...holdings, ...watchlist];
   const rises = allStocks.filter(h => {
@@ -1728,26 +1812,47 @@ async function loadIndexSection() {
   const section = document.getElementById('index-section');
 
   const indices = [
-    { code: 's_sh000001', name: '上证指数' },
-    { code: 's_sz399001', name: '深证成指' },
-    { code: 's_sz399006', name: '创业板指' },
-    { code: 's_sz399300', name: '沪深300'  },
-    { code: 's_sh000905', name: '中证500'  },
-    { code: 's_sh000016', name: '上证50'   },
+    { code: 's_sh000001', name: '上证指数', tc: 'sh000001' },
+    { code: 's_sz399001', name: '深证成指', tc: 'sz399001' },
+    { code: 's_sz399006', name: '创业板指', tc: 'sz399006' },
+    { code: 's_sz399300', name: '沪深300',  tc: 'sz399300' },
+    { code: 's_sh000905', name: '中证500',  tc: 'sh000905' },
+    { code: 's_sh000016', name: '上证50',   tc: 'sh000016' },
   ];
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+indices.map(i=>i.code).join(','))}`;
+
+  // 优先使用腾讯API
   let indexData = {};
   try {
-    const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
-    const json = await resp.json();
-    const raw = json.contents || '';
-    raw.split('\n').forEach(line => {
-      const m = line.match(/var hq_str_([^=]+)="(.*)"/);
+    const tcCodes = indices.map(i => i.tc).join(',');
+    const resp = await fetch(`https://qt.gtimg.cn/q=${tcCodes}`, { signal: AbortSignal.timeout(8000) });
+    const text = await resp.text();
+    text.split(';\n').forEach(line => {
+      const m = line.match(/v_([sh|sz]{2}\d+)="(.*)"/);
       if(!m) return;
-      const parts = m[2].split(',');
-      indexData[m[1]] = { close: parseFloat(parts[1]), pct_chg: parseFloat(parts[3]) };
+      const parts = m[2].split('~');
+      if(parts.length < 48) return;
+      const mapping = {};
+      indices.forEach(idx => { mapping[idx.tc] = idx.code; });
+      const sinaKey = mapping[m[1]];
+      if(sinaKey) indexData[sinaKey] = { close: parseFloat(parts[3]), pct_chg: parseFloat(parts[32]) };
     });
-  } catch(e) { console.warn('大盘指数获取失败'); }
+  } catch(e) { console.warn('腾讯大盘指数失败'); }
+
+  // 回退新浪（仅在腾讯数据不足时）
+  if(Object.keys(indexData).length < 3) {
+    const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://hq.sinajs.cn/list='+indices.map(i=>i.code).join(','))}`;
+    try {
+      const resp = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
+      const json = await resp.json();
+      const raw = json.contents || '';
+      raw.split('\n').forEach(line => {
+        const m = line.match(/var hq_str_([^=]+)="(.*)"/);
+        if(!m) return;
+        const parts = m[2].split(',');
+        indexData[m[1]] = { close: parseFloat(parts[1]), pct_chg: parseFloat(parts[3]) };
+      });
+    } catch(e) { console.warn('大盘指数获取失败'); }
+  }
 
   section.innerHTML = indices.map(idx => {
     const d = indexData[idx.code];
@@ -1845,7 +1950,24 @@ async function loadNews() {
 function loadHoldings() {
   const saved = localStorage.getItem('stock-holdings');
   if(saved) {
-    try { holdings = JSON.parse(saved); return; } catch(e) {}
+    try {
+      holdings = JSON.parse(saved);
+      // 检查是否是旧版空数据（没有cost字段或数量为0），自动升级
+      if(holdings.length > 0 && !holdings[0].cost && DEFAULT_STOCKS.length > 0 && DEFAULT_STOCKS[0].cost) {
+        const needsUpgrade = holdings.some(h => !h.cost && DEFAULT_STOCKS.find(d => d.code === h.code && d.cost));
+        if(needsUpgrade) {
+          holdings = DEFAULT_STOCKS.map(s => ({...s}));
+          saveHoldings();
+          console.log('持仓数据已升级为含成本版本');
+        }
+      }
+      // 如果持仓列表为空但默认列表有数据，使用默认
+      if(holdings.length === 0 && DEFAULT_STOCKS.length > 0) {
+        holdings = DEFAULT_STOCKS.map(s => ({...s}));
+        saveHoldings();
+      }
+      return;
+    } catch(e) {}
   }
   holdings = DEFAULT_STOCKS.map(s => ({...s}));
   saveHoldings();
